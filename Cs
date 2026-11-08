@@ -1,0 +1,1491 @@
+local cloneref = cloneref or function(x) return x end
+
+local Players           = cloneref(game:GetService("Players"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local UserInputService  = cloneref(game:GetService("UserInputService"))
+local TweenService      = cloneref(game:GetService("TweenService"))
+local RunService        = cloneref(game:GetService("RunService"))
+
+local localPlayer = Players.LocalPlayer
+local PlayerGui   = localPlayer:WaitForChild("PlayerGui")
+local Net         = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
+
+local keyboardEnabled = UserInputService.KeyboardEnabled
+local touchOnly       = UserInputService.TouchEnabled and not keyboardEnabled
+
+local getupvalues_    = debug and debug.getupvalues or getupvalues
+local getconnections_ = getconnections or (debug and debug.getconnections)
+local setupvalue_     = debug and debug.setupvalue or setupvalue
+local writeClipboard  = setclipboard or toclipboard or (syn and syn.write_clipboard)
+
+local savedSettings = {}
+
+if readfile and isfile then
+    local ok, contents = pcall(function()
+        if isfile("redeemer_settings.txt") then
+            return readfile("redeemer_settings.txt")
+        end
+    end)
+    if ok and type(contents) == "string" then
+        for line in contents:gmatch("[^\n]+") do
+            local key, value = line:match("^(%w+)=(.*)$")
+            if key then savedSettings[key] = value end
+        end
+    end
+end
+
+function _G.__RdmCfgBool(key, default)
+    local v = savedSettings[key]
+    if v == "1" then return true end
+    if v == "0" then return false end
+    return default
+end
+
+function _G.__RdmCfgStr(key, default)
+    local v = savedSettings[key]
+    return (type(v) == "string" and v ~= "" and v) or default
+end
+
+function _G.__RdmCfgSet(key, value)
+    savedSettings[key] = type(value) == "boolean"
+        and (value and "1" or "0")
+        or tostring(value)
+    if not writefile then return end
+    local lines = {}
+    for k, v in pairs(savedSettings) do
+        lines[#lines + 1] = k .. "=" .. tostring(v)
+    end
+    table.sort(lines)
+    pcall(writefile, "redeemer_settings.txt", table.concat(lines, "\n"))
+end
+
+local CONFIG = {
+    listenKey = Enum.KeyCode.F,
+    maxFeed   = 36,
+    positions = {
+        Top = true, Bottom = true, Center = true, Middle = true,
+        Left = true, Right = true,
+        TopRight = true, TopLeft = true, BottomRight = true, BottomLeft = true,
+    },
+}
+
+local SPEED_PRESETS = { MAX = 0.15 }
+
+local uiScale
+local maxSpamDelay        = SPEED_PRESETS.MAX
+local wordMode            = false
+local retryDelay          = 0.5
+local isListening         = false
+local autoRedeem          = _G.__RdmCfgBool("autoRedeem", true)
+local autoType            = _G.__RdmCfgBool("autoType", true)
+local manual              = _G.__RdmCfgBool("manual", false)
+local isSpamming          = false
+local spamThread          = nil
+local spamCount           = 0
+local wordsToCollect      = 1
+local listenKey           = CONFIG.listenKey
+local redeemKey           = Enum.KeyCode.G
+local rebindingTarget     = nil
+local listenedWords       = {}
+local lastAutoTyped       = nil
+local notifyRemote        = nil
+local remoteFallbackUsed  = false
+local autoListen          = _G.__RdmCfgBool("autoListen", true)
+local spamOnListen        = _G.__RdmCfgBool("spamOnListen", true)
+local showKeybinds        = _G.__RdmCfgBool("showKeybinds", keyboardEnabled)
+local ignoreSystemPhrases = _G.__RdmCfgBool("ignoreSystem", true)
+
+_G.__RdmDuo = _G.__RdmCfgBool("duo", false)
+
+local function stripTags(s)
+    if type(s) ~= "string" then return tostring(s) end
+    return (s:gsub("<[^>]->", ""))
+end
+
+local function trim(s)
+    return (s or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function copyToClipboard(text)
+    if not writeClipboard then return false end
+    return (pcall(writeClipboard, text))
+end
+
+local function extractWords(s)
+    local out = {}
+    for word in s:gmatch("[%w_]+") do out[#out + 1] = word end
+    return out
+end
+
+local function pickCodeCandidate(s)
+    local candidate
+    for word in s:gmatch("[%w_]+") do
+        if #word >= 4 and word:match("%a") and (word:match("%u") or word:match("%d")) then
+            candidate = word
+        end
+    end
+    if candidate then return candidate end
+    for word in s:gmatch("[%w_]+") do
+        if #word >= 4 then return word end
+    end
+end
+
+function _G.__SabClassifyDrop(raw)
+    local text  = tostring(raw or "")
+    local lower = text:lower()
+
+    local words = {}
+    for w in text:gmatch("[%w']+") do words[#words + 1] = w end
+    local wordCount = #words
+    if wordCount == 0 then return nil end
+
+    local padded = " " .. lower:gsub("[^%w]", " ") .. " "
+
+    if lower:find("?", 1, true) then return "riddle" end
+
+    for _, phrase in ipairs({
+        " what ", " how ", " which ", " whose ", " when ", " who ",
+        " whats ", " where ", " why ", " guess ", " riddle ", " answer ",
+    }) do
+        if padded:find(phrase, 1, true) then return "riddle" end
+    end
+
+    if padded:find(" my ", 1, true) then return "riddle" end
+
+    local multiword = wordCount >= 2
+    local hasPlus = multiword and (padded:find(" plus ", 1, true) or lower:find("+", 1, true))
+    if hasPlus then return "riddle" end
+
+    if wordCount >= 4 and padded:find(" and ", 1, true) then return "riddle" end
+
+    if lower:find("code", 1, true) then return "code" end
+    for _, phrase in ipairs({ " redeem ", " type ", " enter ", " claim " }) do
+        if padded:find(phrase, 1, true) then return "code" end
+    end
+
+    if wordCount >= 7 then return "riddle" end
+    if wordCount == 1 then return "code" end
+
+    if wordCount <= 3 then
+        local good = 0
+        for _, w in ipairs(words) do
+            if #w >= 3 and ((w == w:upper() and w:match("%a")) or w:match("%d")) then
+                good = good + 1
+            end
+        end
+        if good == wordCount then return "code" end
+    end
+
+    return nil
+end
+
+local function computeUIScale()
+    if not touchOnly then return 1 end
+    local cam = workspace.CurrentCamera
+    cam = cam and cam.ViewportSize.Y or 600
+    local sizeName = (_G.__RdmCfgStr and _G.__RdmCfgStr("uiSize", "MEDIUM")) or "MEDIUM"
+    local mult = sizeName == "BIG" and 1.15 or sizeName == "SMALL" and 0.8 or 1
+    return math.clamp(cam * 0.88 / 548, 0.5, 1.3) * mult
+end
+uiScale = computeUIScale()
+
+local extractCodeAfterTrigger
+
+do
+    local patterns = {
+        leads = {
+            "use", "using", "redeem", "type", "enter", "claim",
+            "with", "grab", "got", "here is", "heres", "here's",
+            "there is", "theres", "there's",
+        },
+        articles = {
+            "", "the%s+", "a%s+", "an%s+", "this%s+", "your%s+", "new%s+",
+        },
+        patterns = {
+            "code%s+is", "codes?%s+are", "code%s+for", "code%s+to%s+use",
+            "code%s*[:%-]", "new%s+code", "free%s+code", "secret%s+code",
+            "working%s+code", "another%s+code",
+        },
+        names = { "sammy" },
+    }
+
+    for _, lead in ipairs(patterns.leads) do
+        local esc = lead:gsub("%s+", "%%s+")
+        for _, article in ipairs(patterns.articles) do
+            patterns.patterns[#patterns.patterns + 1] = esc .. "%s+" .. article .. "code"
+        end
+    end
+
+    local function firstCodeWordTail(s)
+        for pos, word in s:gmatch("()([%w_]+)") do
+            if #word >= 4 and word:match("%a") and (word:match("%u") or word:match("%d")) then
+                return s:sub(pos)
+            end
+        end
+    end
+    extractCodeAfterTrigger = function(raw)
+        local lower = raw:lower()
+        local bestEnd, bestFlag
+
+        local function scan(pat, plain, flag)
+            local i = 1
+            while true do
+                local ok, s, e = pcall(string.find, lower, pat, i, plain)
+                if not ok or not s then break end
+                if not bestEnd or e > bestEnd then
+                    bestEnd = e
+                    bestFlag = flag
+                end
+                i = e + 1
+            end
+        end
+
+        for _, pat in ipairs(patterns.patterns) do scan(pat, false, false) end
+
+        if lower:find("code") then
+            for _, name in ipairs(patterns.names) do
+                scan(name:lower(), true, true)
+            end
+        end
+
+        if not bestEnd then return nil end
+
+        local tail = raw:sub(bestEnd + 1)
+        local code = firstCodeWordTail(tail)
+        if bestFlag then return code end
+        return code or ""
+    end
+end
+
+local findNotificationRemote
+
+do
+    local function remoteInstancesOf(func)
+        if not getupvalues_ then return {} end
+        local ok, ups = pcall(getupvalues_, func)
+        local out = {}
+        if ok and ups then
+            for _, v in pairs(ups) do
+                if typeof(v) == "Instance"
+                   and (v:IsA("RemoteEvent") or v:IsA("RemoteFunction") or v:IsA("UnreliableRemoteEvent"))
+                   and v.Parent == Net then
+                    table.insert(out, v)
+                end
+            end
+        end
+        return out
+    end
+
+    findNotificationRemote = function()
+        local ok, mod = pcall(function()
+            return require(ReplicatedStorage.Controllers:FindFirstChild("NotificationController", true))
+        end)
+        if ok and type(mod) == "table" and type(mod.Start) == "function" then
+            return remoteInstancesOf(mod.Start)[1]
+        end
+    end
+end
+
+local setCodeBoxText, submitCode
+
+do
+    local function findCodeBox()
+        local codes = PlayerGui:FindFirstChild("Codes")
+        if not codes then return nil end
+        local main = (codes:FindFirstChild("Codes") or codes):FindFirstChild("Main")
+        local box = main and main:FindFirstChild("TextBox")
+        if box and box:IsA("TextBox") then return box end
+        for _, d in ipairs(codes:GetDescendants()) do
+            if d:IsA("TextBox") then return d end
+        end
+    end
+
+    local function findConfirmButton()
+        local codes = PlayerGui:FindFirstChild("Codes")
+        if not codes then return nil end
+        local codes2 = codes:FindFirstChild("Codes") or codes
+        local confirm = (codes2:FindFirstChild("Main") or codes2):FindFirstChild("Confirm")
+        if confirm and (confirm:IsA("ImageButton") or confirm:IsA("TextButton")) then
+            return confirm
+        end
+        local fallback
+        for _, d in ipairs(codes:GetDescendants()) do
+            if d:IsA("ImageButton") or d:IsA("TextButton") then
+                local n = d.Name:lower()
+                if n:find("confirm") or n:find("submit") or n:find("redeem") or n:find("enter") then
+                    return d
+                end
+                fallback = fallback or d
+            end
+        end
+        return fallback
+    end
+
+    local function clearBooleans(fn, depth)
+        if not (fn and setupvalue_ and getupvalues_) then return end
+        depth = depth or 1
+        local ok, ups = pcall(getupvalues_, fn)
+        if ok and type(ups) == "table" then
+            for k, v in pairs(ups) do
+                if type(v) == "boolean" then
+                    pcall(setupvalue_, fn, k, false)
+                elseif type(v) == "function" and depth > 0 then
+                    clearBooleans(v, depth - 1)
+                end
+            end
+        end
+    end
+
+    local function fireConnections(signal, ...)
+        if not getconnections_ then return false end
+        local ok, conns = pcall(getconnections_, signal)
+        if not ok or type(conns) ~= "table" or #conns == 0 then return false end
+
+        local args = table.pack(...)
+        local any = false
+        for _, c in ipairs(conns) do
+            if c.Enabled ~= false then
+                local cb
+                pcall(function() cb = c.Function end)
+                clearBooleans(cb)
+
+                local ok2
+                if cb then
+                    ok2 = pcall(task.spawn, cb, table.unpack(args, 1, args.n))
+                else
+                    ok2 = pcall(function() c:Fire(table.unpack(args, 1, args.n)) end)
+                end
+                any = any or ok2
+            end
+        end
+        return any
+    end
+
+    setCodeBoxText = function(text)
+        if type(text) ~= "string" or text == "" then return end
+        local box = findCodeBox()
+        if not box then return end
+        pcall(function()
+            if box.Text ~= text then box.Text = text end
+        end)
+    end
+
+    local function trySubmitViaConnections(text)
+        if not getconnections_ then return false, "no getconnections" end
+        local box = findCodeBox()
+        if not box then return false, "code box not found" end
+        pcall(function()
+            box.Text = text
+            box.Active = true
+            box.Selectable = true
+        end)
+
+        local confirm = findConfirmButton()
+        local ok = false
+        if confirm then
+            local a = fireConnections(confirm.MouseButton1Click)
+            local b = fireConnections(confirm.Activated)
+            ok = a or b or false
+        end
+        if not ok then
+            ok = fireConnections(box.FocusLost, true) or ok
+        end
+        return ok, ok and "submitted" or "no submit control"
+    end
+
+    local function trySubmitViaFocus(text)
+        local box = findCodeBox()
+        if not box then return false, "code box not found" end
+        if not pcall(function()
+            box.Text = text
+            box:CaptureFocus()
+        end) then
+            return false, "focus failed"
+        end
+        task.wait(0.1)
+        local ok = pcall(function() box:ReleaseFocus(true) end)
+        return ok, ok and "submitted" or "release failed"
+    end
+
+    submitCode = function(text)
+        local ok, msg = trySubmitViaConnections(text)
+        if ok then return true, msg end
+        if getconnections_ then return false, msg end
+        return trySubmitViaFocus(text)
+    end
+end
+
+local eventBlock = {
+    ready = false,
+    why   = "EventController unavailable",
+    IsBlocked = function() return false end,
+}
+
+do
+    local function requireController(name)
+        local folder = ReplicatedStorage:FindFirstChild("Controllers")
+        folder = folder and folder:FindFirstChild(name, true)
+        if not (folder and folder:IsA("ModuleScript")) then return nil end
+        local ok, mod = pcall(require, folder)
+        if ok and type(mod) == "table" then return mod end
+    end
+
+    local EventController  = requireController("EventController")
+    local EffectController = requireController("EffectController")
+
+    local valid = EventController
+        and type(EventController.Events) == "table"
+        and type(EventController.Execute) == "function"
+
+    if not valid then
+        eventBlock.why = "EventController missing Events/Execute"
+    else
+        local tool = _G.__BrainrotEventTool
+        if not tool then
+            tool = {}
+            _G.__BrainrotEventTool = tool
+        end
+
+        tool.origExecute   = tool.origExecute   or EventController.Execute
+        tool.origGetActive = tool.origGetActive or EventController.GetActiveEvents
+        if EffectController then
+            tool.origRun = tool.origRun or EffectController.Run
+        end
+        tool.fakes        = tool.fakes        or {}
+        tool.capture      = tool.capture      or {}
+        tool.spawned      = tool.spawned      or {}
+        tool.clearedAttrs = tool.clearedAttrs or {}
+        tool.stashed      = tool.stashed      or {}
+        if tool.blocked == nil then tool.blocked = false end
+
+        eventBlock.S = tool
+        eventBlock.IsBlocked = function() return tool.blocked and true or false end
+
+        local effectsTable
+        local getupvalue_ = debug and debug.getupvalue
+        if getupvalue_ then
+            local ok, v = pcall(getupvalue_, tool.origExecute, 5)
+            if ok and type(v) == "table" then effectsTable = v end
+        end
+
+        if not tool.shimmed then
+            EventController.GetActiveEvents = function(self)
+                local list = {}
+                if not tool.blocked then
+                    local ok, res = pcall(tool.origGetActive, self)
+                    if ok and type(res) == "table" then
+                        for _, e in pairs(res) do list[#list + 1] = e end
+                    end
+                end
+                for _, fake in pairs(tool.fakes) do list[#list + 1] = fake end
+                return list
+            end
+            tool.shimmed = true
+        end
+
+        local function refreshControllers()
+            local lighting = requireController("LightingController")
+            if lighting and type(lighting.Update) == "function" then
+                pcall(function() lighting:Update() end)
+            end
+            local sound = requireController("SoundController")
+            if sound and type(sound.UpdateOST) == "function" then
+                pcall(function() sound:UpdateOST() end)
+            end
+        end
+
+        local function isSkyEffect(inst)
+            return inst:IsA("Sky") or inst:IsA("Atmosphere")
+                or inst:IsA("Clouds") or inst:IsA("PostEffect")
+        end
+
+        local function stopAllEffects()
+            if not (EffectController and type(EffectController.ActiveEffects) == "table") then
+                return 0
+            end
+            local keys = {}
+            for k in pairs(EffectController.ActiveEffects) do keys[#keys + 1] = k end
+            for _, k in ipairs(keys) do
+                local def = type(EffectController.Effects) == "table"
+                    and EffectController.Effects[k] or nil
+                EffectController.ActiveEffects[k] = nil
+                if type(def) == "table" then
+                    if type(def.OnUpdate) == "function" then pcall(function() def:OnUpdate() end) end
+                    if type(def.OnStop) == "function"   then pcall(function() def:OnStop() end)   end
+                end
+            end
+            return #keys
+        end
+
+        local ATTR_KEEP = {
+            EventsLoaded = true, NextCrystalEvent = true, CrystalEventLastTime = true,
+            SantaMerchantStockId = true, SantaMerchantNextStockId = true,
+            FuseMachineLuck = true, FuseMachineLuckTimer = true,
+        }
+        local EVENT_ATTRS = {
+            "AyMiGatitoEvent", "ChicleteiraBicicleteiraEvent", "EasterEvent",
+            "ExtinctEvent", "IndonesiaEvent", "MeowlEvent", "MexicoEvent",
+            "RipMyGrannyEvent", "SkibidiEvent", "StPatricksEvent",
+            "StrawberryEvent", "TrickOrTreatEvent", "ValentinesEvent",
+            "YinYangEvent", "WitchingHourEvent",
+        }
+        local FX_NAMES = { "Lighting", "WallRecolor", "Atmosphere" }
+
+        local function updateFx()
+            if not (EffectController and type(EffectController.Effects) == "table") then return end
+            for _, name in ipairs(FX_NAMES) do
+                local fx = EffectController.Effects[name]
+                if fx and type(fx.OnUpdate) == "function" then
+                    pcall(function() fx:OnUpdate() end)
+                end
+            end
+        end
+
+        local function clearEventAttrs()
+            local set = {}
+            for _, n in ipairs(EVENT_ATTRS) do set[n] = true end
+            local cleared = 0
+            for k, v in pairs(ReplicatedStorage:GetAttributes()) do
+                if type(k) == "string" and v == true and not ATTR_KEEP[k] then
+                    if set[k] or k:find("Event") or k:find("Phase") or k:find("Hour") then
+                        pcall(function() ReplicatedStorage:SetAttribute(k, nil) end)
+                        tool.clearedAttrs[k] = true
+                        cleared = cleared + 1
+                    end
+                end
+            end
+            updateFx()
+            return cleared
+        end
+
+        local function restoreEventAttrs()
+            local n = 0
+            for k in pairs(tool.clearedAttrs) do
+                pcall(function() ReplicatedStorage:SetAttribute(k, true) end)
+                n = n + 1
+            end
+            table.clear(tool.clearedAttrs)
+            updateFx()
+            return n
+        end
+
+        local function stopLoopedSounds()
+            local n = 0
+            for _, d in ipairs(workspace:GetDescendants()) do
+                if d:IsA("Sound") and d.Playing and d.Looped then
+                    pcall(function() d:Stop() end)
+                    n = n + 1
+                end
+            end
+            return n
+        end
+
+        local function restoreStashed()
+            local n = 0
+            for k, parent in pairs(tool.stashed) do
+                if typeof(k) == "Instance" then
+                    pcall(function() k.Parent = parent end)
+                    n = n + 1
+                end
+                tool.stashed[k] = nil
+            end
+            return n
+        end
+
+        local function getEffectsApi()
+            local e = _G.Effects
+            if type(e) == "table"
+               and type(e.Block) == "function"
+               and type(e.Unblock) == "function" then
+                return e
+            end
+        end
+
+        eventBlock.Block = function()
+            local api = getEffectsApi()
+            if api then
+                api.Block()
+                tool.blocked = true
+                return true, "blocked (effects panel)"
+            end
+
+            local cancelled = 0
+            for k, ev in pairs(EventController.Events) do
+                if type(ev) == "table" and rawget(ev, "Active") then
+                    local ok = type(EventController.Cancel) == "function"
+                        and pcall(function() return EventController:Cancel(k) end)
+                    if not ok then
+                        rawset(ev, "Active", false)
+                        rawset(ev, "__started", false)
+                    end
+                    cancelled = cancelled + 1
+                end
+            end
+
+            local effectsKilled = stopAllEffects()
+
+            for k, cap in pairs(tool.capture) do
+                if type(cap) == "table" and type(cap.caught) == "table" then
+                    for inst in pairs(cap.caught) do
+                        if typeof(inst) == "Instance" and inst.Parent and not isSkyEffect(inst) then
+                            pcall(function() inst:Destroy() end)
+                        end
+                    end
+                end
+                tool.capture[k] = nil
+            end
+
+            table.clear(tool.spawned)
+            table.clear(tool.fakes)
+
+            if effectsTable then
+                for k, group in pairs(effectsTable) do
+                    if type(group) == "table" then
+                        for _, inst in ipairs(group) do
+                            if typeof(inst) == "Instance" and not isSkyEffect(inst) then
+                                pcall(function() inst:Destroy() end)
+                            end
+                        end
+                    end
+                    effectsTable[k] = nil
+                end
+            end
+
+            EventController.Execute = function() return false end
+            if EffectController then
+                EffectController.Run = function() return false, false end
+            end
+
+            tool.blocked = true
+            refreshControllers()
+            clearEventAttrs()
+
+            local sounds = stopLoopedSounds()
+            return true, ("blocked %d event(s), %d fx, %d sound(s)")
+                :format(cancelled, effectsKilled, sounds)
+        end
+
+        eventBlock.Unblock = function()
+            local api = getEffectsApi()
+            if api then
+                api.Unblock()
+                tool.blocked = false
+                return true, "unblocked (effects panel)"
+            end
+
+            EventController.Execute = tool.origExecute
+            if EffectController and tool.origRun then
+                EffectController.Run = tool.origRun
+            end
+            tool.blocked = false
+
+            local attrs = restoreEventAttrs()
+            local models = restoreStashed()
+            refreshControllers()
+            return true, ("unblocked - %d flag(s), %d model(s) restored"):format(attrs, models)
+        end
+
+        eventBlock.ready = true
+        eventBlock.why   = nil
+    end
+end
+
+local THEME = {
+    bg     = Color3.fromRGB(8, 6, 11),
+    panel  = Color3.fromRGB(19, 14, 23),
+    panel2 = Color3.fromRGB(31, 23, 37),
+    line   = Color3.fromRGB(48, 36, 54),
+    acc    = Color3.fromRGB(214, 104, 36),
+    acc2   = Color3.fromRGB(166, 72, 20),
+    accHi  = Color3.fromRGB(236, 150, 84),
+    txt    = Color3.fromRGB(234, 226, 214),
+    sub    = Color3.fromRGB(150, 138, 152),
+    ok     = Color3.fromRGB(116, 186, 96),
+    err    = Color3.fromRGB(196, 64, 64),
+    warn   = Color3.fromRGB(222, 176, 86),
+    input  = Color3.fromRGB(11, 8, 14),
+    dark   = Color3.fromRGB(7, 4, 11),
+}
+
+local FONT_MED   = Enum.Font.GothamMedium
+local FONT_BOLD  = Enum.Font.GothamBold
+local FONT_BLACK = Enum.Font.GothamBlack
+
+local function create(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function corner(inst, radius)
+    create("UICorner", { CornerRadius = UDim.new(0, radius or 8) }, inst)
+end
+
+local function stroke(inst, color, thickness, transparency)
+    return create("UIStroke", {
+        Color = color or THEME.line,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0,
+    }, inst)
+end
+
+local function tween(inst, time, goal, easing)
+    TweenService:Create(inst, TweenInfo.new(time, easing or Enum.EasingStyle.Quad), goal):Play()
+end
+
+local function gradient(inst, c1, c2, rotation)
+    return create("UIGradient", {
+        Color = ColorSequence.new(c1, c2),
+        Rotation = rotation or 90,
+    }, inst)
+end
+
+local function label(text, size, color, font, xAlign, parent)
+    return create("TextLabel", {
+        BackgroundTransparency = 1,
+        Text = text,
+        Font = font or FONT_MED,
+        TextSize = size or 12,
+        TextColor3 = color or THEME.txt,
+        TextXAlignment = xAlign or Enum.TextXAlignment.Left,
+    }, parent)
+end
+
+local function makeDraggable(handle, target)
+    local dragging, startPos, startTarget
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+           or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            startPos = input.Position
+            startTarget = target.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+           or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - startPos
+            target.Position = UDim2.new(
+                startTarget.X.Scale, startTarget.X.Offset + delta.X,
+                startTarget.Y.Scale, startTarget.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+local function createWindow(name, w, h, title)
+    local win = create("Frame", {
+        Name = name,
+        Size = UDim2.fromOffset(w, h),
+        BackgroundColor3 = THEME.bg,
+        BorderSizePixel = 0,
+        Active = true,
+        ClipsDescendants = true,
+    })
+    corner(win, 14)
+    gradient(win, Color3.fromRGB(20, 12, 30), Color3.fromRGB(8, 6, 11), 90)
+    stroke(win, THEME.acc, 1.5, 0.45)
+    if touchOnly then
+        create("UIScale", { Name = "WinScale", Scale = uiScale }, win)
+    end
+
+    local bar = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundColor3 = THEME.panel,
+        BorderSizePixel = 0,
+    }, win)
+    corner(bar, 14)
+    create("Frame", {
+        Size = UDim2.new(1, 0, 0, 14),
+        Position = UDim2.new(0, 0, 1, -14),
+        BackgroundColor3 = THEME.panel,
+        BorderSizePixel = 0,
+    }, bar)
+
+    local icon = create("ImageLabel", {
+        Size = UDim2.fromOffset(24, 24),
+        Position = UDim2.new(0, 12, 0.5, -12),
+        BackgroundColor3 = THEME.panel2,
+        BorderSizePixel = 0,
+        Image = "rbxthumb://type=Asset&id=129730513254619&w=150&h=150",
+    }, bar)
+    corner(icon, 12)
+    stroke(icon, THEME.acc, 1.5, 0.2)
+
+    local titleLabel = label(title, 15, THEME.txt, FONT_BLACK, Enum.TextXAlignment.Left, bar)
+    titleLabel.Size = UDim2.new(1, -80, 1, 0)
+    titleLabel.Position = UDim2.fromOffset(44, 0)
+
+    makeDraggable(bar, win)
+    return win, bar, icon, titleLabel
+end
+
+local function createButton(text, parent)
+    local btn = create("TextButton", {
+        BackgroundColor3 = THEME.panel2,
+        Text = text,
+        Font = FONT_BOLD,
+        TextSize = 12,
+        TextColor3 = THEME.txt,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(btn, 8)
+    local st = stroke(btn, THEME.line, 1, 0.2)
+
+    btn.MouseEnter:Connect(function()
+        tween(btn, 0.12, { BackgroundColor3 = THEME.panel })
+        tween(st,  0.12, { Color = THEME.acc, Transparency = 0 })
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, 0.12, { BackgroundColor3 = THEME.panel2 })
+        tween(st,  0.12, { Color = THEME.line, Transparency = 0.2 })
+    end)
+    return btn
+end
+
+local function createAccentButton(text, parent)
+    local btn = create("TextButton", {
+        BackgroundColor3 = THEME.acc,
+        Text = text,
+        Font = FONT_BLACK,
+        TextSize = 13,
+        TextColor3 = Color3.fromRGB(30, 12, 4),
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(btn, 8)
+    gradient(btn, THEME.acc, THEME.acc2, 90)
+    btn.MouseEnter:Connect(function()
+        tween(btn, 0.12, { BackgroundColor3 = THEME.accHi })
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, 0.12, { BackgroundColor3 = THEME.acc })
+    end)
+    return btn
+end
+
+local hui = (gethui and gethui()) or PlayerGui
+local oldGui = hui:FindFirstChild("Traced")
+if oldGui then oldGui:Destroy() end
+
+local ScreenGui = create("ScreenGui", {
+    Name = "Traced",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 250,
+}, hui)
+
+local Main, MainBar, MainIcon, MainTitle = createWindow("Main", 316, 548, "TRACED")
+Main.Position = UDim2.new(1, -340, 0.5, -274)
+if touchOnly then
+    Main.Position = UDim2.new(1, -math.floor(316 * uiScale) - 8, 0.5, -math.floor(548 * uiScale / 2))
+end
+Main.Parent = ScreenGui
+MainTitle.Size = UDim2.new(1, -262, 1, 0)
+
+corner(create("ImageLabel", {
+    Name = "CityBg",
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 0,
+    Image = "rbxthumb://type=Asset&id=96519310989847&w=420&h=420",
+    ImageTransparency = 0.5,
+    ImageColor3 = Color3.fromRGB(214, 130, 60),
+    ScaleType = Enum.ScaleType.Crop,
+}, Main), 14)
+
+do
+    local leaves = create("Frame", {
+        Name = "LeavesLayer",
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 0,
+        ClipsDescendants = true,
+    }, Main)
+    corner(leaves, 14)
+
+    local palette = {
+        Color3.fromRGB(236, 150, 84),
+        Color3.fromRGB(214, 104, 36),
+        Color3.fromRGB(166, 72, 20),
+        Color3.fromRGB(255, 176, 108),
+        Color3.fromRGB(230, 110, 160),
+    }
+
+    for _ = 1, 18 do
+        task.spawn(function()
+            task.wait(math.random() * 2.5)
+            while leaves.Parent do
+                local w = math.random(5, 8)
+                local h = w + math.random(2, 4)
+                local x = math.random()
+
+                local leaf = create("Frame", {
+                    Size = UDim2.new(0, w, 0, h),
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    Position = UDim2.new(x, 0, 0, -h),
+                    BackgroundColor3 = palette[math.random(#palette)],
+                    BackgroundTransparency = 0.15 + math.random() * 0.3,
+                    BorderSizePixel = 0,
+                    ZIndex = 0,
+                    Rotation = math.random(0, 359),
+                }, leaves)
+                corner(leaf, 999)
+                create("UIGradient", {
+                    Rotation = math.random(0, 359),
+                    Transparency = NumberSequence.new({
+                        NumberSequenceKeypoint.new(0, 0),
+                        NumberSequenceKeypoint.new(1, 0.55),
+                    }),
+                }, leaf)
+
+                local duration = 4 + math.random() * 2.6
+                local drift = (math.random() - 0.5) * 0.3
+                local spin = math.random(180, 540) * (math.random() < 0.5 and -1 or 1)
+
+                TweenService:Create(leaf, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+                    Position = UDim2.new(x + drift, 0, 1, h * 2),
+                    Rotation = leaf.Rotation + spin,
+                }):Play()
+
+                task.wait(duration)
+                if leaf and leaf.Parent then leaf:Destroy() end
+                task.wait(math.random() * 0.5)
+            end
+        end)
+    end
+end
+
+local statusDotNotify = create("Frame", {
+    Size = UDim2.fromOffset(8, 8),
+    Position = UDim2.new(1, -212, 0.5, -4),
+    BackgroundColor3 = THEME.sub,
+    BorderSizePixel = 0,
+    Visible = false,
+}, MainBar)
+corner(statusDotNotify, 4)
+
+local RagBtn   = createButton("Rag",   MainBar)
+local TestBtn  = createButton("Test",  MainBar)
+local FeedBtn  = createButton("Feed",  MainBar)
+local SetBtn   = createButton("Settings", MainBar)
+RagBtn.Size  = UDim2.fromOffset(38, 22); RagBtn.Position  = UDim2.new(1, -200, 0.5, -11); RagBtn.TextSize  = 10
+TestBtn.Size = UDim2.fromOffset(38, 22); TestBtn.Position = UDim2.new(1, -157, 0.5, -11); TestBtn.TextSize = 10
+FeedBtn.Size = UDim2.fromOffset(38, 22); FeedBtn.Position = UDim2.new(1, -114, 0.5, -11); FeedBtn.TextSize = 10
+SetBtn.Size  = UDim2.fromOffset(38, 22); SetBtn.Position  = UDim2.new(1, -71,  0.5, -11); SetBtn.TextSize  = 10
+
+local expandedHeight = 548
+local collapsed = false
+
+do
+    local collapse = createButton("", MainBar)
+    collapse.Size = UDim2.fromOffset(22, 22)
+    collapse.Position = UDim2.new(1, -28, 0.5, -11)
+    corner(create("Frame", {
+        Size = UDim2.fromOffset(10, 2),
+        Position = UDim2.new(0.5, -5, 0.5, -1),
+        BackgroundColor3 = THEME.txt,
+        BorderSizePixel = 0,
+    }, collapse), 1)
+
+    local plus = create("Frame", {
+        Size = UDim2.fromOffset(2, 10),
+        Position = UDim2.new(0.5, -1, 0.5, -5),
+        BackgroundColor3 = THEME.txt,
+        BorderSizePixel = 0,
+        Visible = false,
+    }, collapse)
+    corner(plus, 1)
+
+    collapse.MouseButton1Click:Connect(function()
+        collapsed = not collapsed
+        plus.Visible = collapsed
+        tween(Main, 0.25, { Size = UDim2.fromOffset(316, collapsed and 179 or expandedHeight) })
+    end)
+end
+
+local content = create("Frame", {
+    Size = UDim2.new(1, -20, 1, -54),
+    Position = UDim2.fromOffset(10, 48),
+    BackgroundTransparency = 1,
+}, Main)
+create("UIListLayout", {
+    Padding = UDim.new(0, 5),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, content)
+
+local statusLabel
+local setStatus
+
+do
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 32),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 1,
+    }, content)
+    corner(row, 9)
+    stroke(row, THEME.line, 1, 0.3)
+
+    local dot = create("Frame", {
+        Size = UDim2.fromOffset(8, 8),
+        Position = UDim2.new(0, 12, 0.5, -4),
+        BackgroundColor3 = THEME.sub,
+        BorderSizePixel = 0,
+    }, row)
+    corner(dot, 4)
+
+    statusLabel = label("starting...", 12, THEME.txt, FONT_BOLD, Enum.TextXAlignment.Left, row)
+    statusLabel.Size = UDim2.new(1, -32, 1, 0)
+    statusLabel.Position = UDim2.fromOffset(28, 0)
+    statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+    setStatus = function(text, kind)
+        statusLabel.Text = text
+        local c = kind == "ok"   and THEME.ok
+              or  kind == "err"  and THEME.err
+              or  kind == "busy" and THEME.acc
+              or  kind == "wait" and THEME.warn
+              or  THEME.txt
+        statusLabel.TextColor3 = c
+        dot.BackgroundColor3 = c
+    end
+end
+
+local codeBox
+do
+    local box = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 50),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 2,
+    }, content)
+    corner(box, 9)
+    stroke(box, THEME.line, 1, 0.3)
+
+    local heading = label("CODE", 9, THEME.acc, FONT_BLACK, Enum.TextXAlignment.Left, box)
+    heading.Size = UDim2.new(1, -16, 0, 11)
+    heading.Position = UDim2.fromOffset(11, 5)
+
+    codeBox = create("TextBox", {
+        Size = UDim2.new(1, -18, 0, 26),
+        Position = UDim2.fromOffset(9, 18),
+        BackgroundColor3 = THEME.input,
+        Text = "",
+        PlaceholderText = "type or snipe a code...",
+        PlaceholderColor3 = THEME.sub,
+        Font = FONT_BLACK,
+        TextSize = 14,
+        TextColor3 = THEME.txt,
+        ClearTextOnFocus = false,
+        BorderSizePixel = 0,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, box)
+    corner(codeBox, 7)
+
+    local boxStroke = stroke(codeBox, THEME.line, 1.2, 0.25)
+    create("UIPadding", {
+        PaddingLeft = UDim.new(0, 9),
+        PaddingRight = UDim.new(0, 9),
+    }, codeBox)
+
+    codeBox.Focused:Connect(function()
+        tween(boxStroke, 0.12, { Color = THEME.acc, Transparency = 0 })
+    end)
+    codeBox.FocusLost:Connect(function()
+        tween(boxStroke, 0.12, { Color = THEME.line, Transparency = 0.25 })
+    end)
+end
+
+local copyBtn, clearBtn, redeemBtn
+do
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 33),
+        BackgroundTransparency = 1,
+        LayoutOrder = 3,
+    }, content)
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, row)
+
+    copyBtn = createButton("COPY", row)
+    copyBtn.Size = UDim2.new(1/3, -4, 1, 0); copyBtn.LayoutOrder = 1
+
+    clearBtn = createButton("CLEAR", row)
+    clearBtn.Size = UDim2.new(1/3, -4, 1, 0); clearBtn.LayoutOrder = 2
+
+    redeemBtn = createAccentButton("REDEEM", row)
+    redeemBtn.Size = UDim2.new(1/3, -4, 1, 0); redeemBtn.LayoutOrder = 3
+end
+
+local function createToggle(parent, order, text, initial, onChange)
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = order,
+    }, parent)
+    corner(row, 9)
+    stroke(row, THEME.line, 1, 0.3)
+
+    local lbl = label(text, 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, row)
+    lbl.Size = UDim2.new(1, -56, 1, 0)
+    lbl.Position = UDim2.fromOffset(12, 0)
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+    local track = create("Frame", {
+        Size = UDim2.fromOffset(36, 18),
+        Position = UDim2.new(1, -44, 0.5, -9),
+        BackgroundColor3 = THEME.line,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 9)
+
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.new(0, 2, 0.5, -7),
+        BackgroundColor3 = THEME.txt,
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 7)
+
+    local state = initial
+    local function render()
+        tween(track, 0.16, { BackgroundColor3 = state and THEME.acc or THEME.line })
+        tween(knob, 0.16, { Position = UDim2.new(0, state and 20 or 2, 0.5, -7) }, Enum.EasingStyle.Back)
+        tween(lbl,  0.16, { TextColor3 = state and THEME.txt or THEME.sub })
+    end
+    render()
+
+    local hit = create("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "" }, row)
+    hit.MouseButton1Click:Connect(function()
+        state = not state
+        render()
+        if onChange then onChange(state) end
+    end)
+    return row
+end
+
+local listenLabel, listenTrack, listenKnob, listenHit
+do
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 4,
+    }, content)
+    corner(row, 9)
+    stroke(row, THEME.line, 1, 0.3)
+
+    listenLabel = label("LISTEN", 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, row)
+    listenLabel.Size = UDim2.new(1, -56, 1, 0)
+    listenLabel.Position = UDim2.fromOffset(12, 0)
+
+    listenTrack = create("Frame", {
+        Size = UDim2.fromOffset(36, 18),
+        Position = UDim2.new(1, -44, 0.5, -9),
+        BackgroundColor3 = THEME.line,
+        BorderSizePixel = 0,
+    }, row)
+    corner(listenTrack, 9)
+
+    listenKnob = create("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.new(0, 2, 0.5, -7),
+        BackgroundColor3 = THEME.txt,
+        BorderSizePixel = 0,
+    }, listenTrack)
+    corner(listenKnob, 7)
+
+    listenHit = create("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, row)
+end
+
+local listenKeyBtn, listenKeyClear
+local redeemKeyBtn, redeemKeyClear
+local listenKeyRow, redeemKeyRow
+
+do
+    listenKeyRow = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 5,
+    }, content)
+    corner(listenKeyRow, 9)
+    stroke(listenKeyRow, THEME.line, 1, 0.3)
+
+    local lbl = label("LISTEN KEY", 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, listenKeyRow)
+    lbl.Size = UDim2.new(1, -100, 1, 0)
+    lbl.Position = UDim2.fromOffset(12, 0)
+
+    listenKeyBtn = createButton(listenKey and listenKey.Name or "-", listenKeyRow)
+    listenKeyBtn.Size = UDim2.fromOffset(46, 24)
+    listenKeyBtn.Position = UDim2.new(1, -84, 0.5, -12)
+    listenKeyBtn.TextSize = 11
+
+    listenKeyClear = createButton("X", listenKeyRow)
+    listenKeyClear.Size = UDim2.fromOffset(24, 24)
+    listenKeyClear.Position = UDim2.new(1, -32, 0.5, -12)
+    listenKeyClear.TextSize = 12
+end
+
+do
+    redeemKeyRow = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 6,
+    }, content)
+    corner(redeemKeyRow, 9)
+    stroke(redeemKeyRow, THEME.line, 1, 0.3)
+
+    local lbl = label("REDEEM KEY", 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, redeemKeyRow)
+    lbl.Size = UDim2.new(1, -100, 1, 0)
+    lbl.Position = UDim2.fromOffset(12, 0)
+
+    redeemKeyBtn = createButton(redeemKey and redeemKey.Name or "-", redeemKeyRow)
+    redeemKeyBtn.Size = UDim2.fromOffset(46, 24)
+    redeemKeyBtn.Position = UDim2.new(1, -84, 0.5, -12)
+    redeemKeyBtn.TextSize = 11
+
+    redeemKeyClear = createButton("X", redeemKeyRow)
+    redeemKeyClear.Size = UDim2.fromOffset(24, 24)
+    redeemKeyClear.Position = UDim2.new(1, -32, 0.5, -12)
+    redeemKeyClear.TextSize = 12
+end
+
+createToggle(content, 7, "AUTO REDEEM", autoRedeem, function(v)
+    autoRedeem = v
+    _G.__RdmCfgSet("autoRedeem", v)
+end)
+
+createToggle(content, 8, "AUTO TYPE", autoType, function(v)
+    autoType = v
+    _G.__RdmCfgSet("autoType", v)
+end)
+
+createToggle(content, 9, "MANUAL", manual, function(v)
+    manual = v
+    listenedWords = {}
+end)
+
+local wordsRow
+local function createSegmented(parent, order, name, options, initial, onChange)
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = order,
+    }, parent)
+    corner(row, 9)
+    stroke(row, THEME.line, 1, 0.3)
+
+    local lbl = label(name, 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, row)
+    lbl.Size = UDim2.fromOffset(56, 31)
+    lbl.Position = UDim2.fromOffset(11, 0)
+
+    local track = create("Frame", {
+        Size = UDim2.fromOffset(168, 23),
+        Position = UDim2.new(1, -177, 0.5, -11.5),
+        BackgroundColor3 = THEME.input,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 7)
+
+    local btns = {}
+    local function render(selected)
+        for key, btn in pairs(btns) do
+            local active = key == selected
+            tween(btn, 0.12, { BackgroundColor3 = active and THEME.acc or THEME.input })
+            btn.TextColor3 = active and Color3.fromRGB(30, 12, 4) or THEME.sub
+        end
+        if onChange then onChange(selected) end
+    end
+
+    for i, opt in ipairs(options) do
+        local key = type(opt) == "table" and opt[1] or opt
+        local text = type(opt) == "table" and opt[2] or opt
+        local btn = create("TextButton", {
+            Size = UDim2.new(1/#options, -2, 1, -2),
+            Position = UDim2.new((i-1)/#options, 1, 0, 1),
+            BackgroundColor3 = THEME.input,
+            Text = text,
+            Font = FONT_BOLD,
+            TextSize = text:find("\n") and 8 or 10,
+            TextColor3 = THEME.sub,
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+        }, track)
+        corner(btn, 6)
+        btns[key] = btn
+        btn.MouseButton1Click:Connect(function() render(key) end)
+    end
+
+    render(initial)
+    return row, render
+end
+
+local _, refreshWords = createSegmented(content, 11, "WORDS",
+    { "1", "2", "3", "4" }, tostring(wordsToCollect),
+    function(v)
+        wordsToCollect = tonumber(v) or 1
+        listenedWords = {}
+        if isListening and not manual then
+            setStatus(("listening... 0/%d"):format(wordsToCollect), "wait")
+        end
+    end)
+wordsRow = content:GetChildren()[#content:GetChildren()]
+
+local spamStroke, spamLabel, spamStartBtn, spamDot
+do
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 12,
+    }, content)
+    corner(row, 9)
+    spamStroke = stroke(row, THEME.line, 1, 0.3)
+
+    spamLabel = label("SPAM REDEEM", 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, row)
+    spamLabel.Size = UDim2.new(1, -94, 1, 0)
+    spamLabel.Position = UDim2.fromOffset(11, 0)
+
+    spamStartBtn = createButton("START", row)
+    spamStartBtn.Size = UDim2.fromOffset(70, 24)
+    spamStartBtn.Position = UDim2.new(1, -78, 0.5, -12)
+    spamStartBtn.TextSize = 11
+
+    spamDot = create("Frame", {
+        Size = UDim2.fromOffset(7, 7),
+        Position = UDim2.new(0, 9, 0.5, -3.5),
+        BackgroundColor3 = THEME.line,
+        BorderSizePixel = 0,
+    }, spamStartBtn)
+    corner(spamDot, 4)
+
+    createSegmented(content, 13, "SPEED",
+        { "MAX", { "WORD", "EVERY\nWORD" } },
+        _G.__RdmCfgBool("wordMode", false) and "WORD" or "MAX",
+        function(v)
+            wordMode = v == "WORD"
+            if not wordMode then
+                maxSpamDelay = SPEED_PRESETS[v] or SPEED_PRESETS.MAX
+            end
+            _G.__RdmCfgSet("speed", v)
+            _G.__RdmCfgSet("wordMode", wordMode)
+        end)
+end
+
+for _, d in ipairs(content:GetDescendants()) do
+    if d:IsA("TextButton") and d.Text == "EVERY\nWORD" then
+        create("TextLabel", {
+            Size = UDim2.fromOffset(64, 8),
+            AnchorPoint = Vector2.new(0.5, 1),
+            Position = UDim2.new(0.5, 0, 0, -1),
+            BackgroundTransparency = 1,
+            TextColor3 = THEME.warn,
+            TextTransparency = 0.35,
+            Font = FONT_BLACK,
+            TextSize = 8,
+            Text = "RECOMMENDED",
+            ZIndex = 3,
+        }, d)
+        break
+    end
+end
+
+do
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 31),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        LayoutOrder = 14,
+    }, content)
+    corner(row, 9)
+    stroke(row, THEME.line, 1, 0.3)
+
+    local lbl = label("EVENTS", 11, THEME.sub, FONT_BOLD, Enum.TextXAlignment.Left, row)
+    lbl.Size = UDim2.new(1, -104, 1, 0)
+    lbl.Position = UDim2.fromOffset(11, 0)
+
+    local blockAll = createButton("BLOCK ALL", row)
+    blockAll.Size = UDim2.fromOffset(88, 24)
+    blockAll.Position = UDim2.new(1, -97, 0.5, -12)
+    blockAll.TextSize = 10
+
+    local busy = false
+    local lastKey = nil
+    local pendingMsg, pendingKind
+    local blockedUntil = 0
+
+    local function render()
+        local blocked = os.clock() < blockedUntil
+        local key = tostring(eventBlock.ready) .. tostring(blocked)
+        if key == lastKey then return end
+        lastKey = key
+        blockAll.Text = blocked and "BLOCKED" or "BLOCK ALL"
+        blockAll.TextColor3 = not eventBlock.ready and THEME.sub
+            or blocked and THEME.ok or THEME.txt
+    end
+
+    blockAll.MouseButton1Click:Connect(function()
+        if busy then return end
+        if not eventBlock.ready then
+            setStatus("events: " .. tostring(eventBlock.why), "err")
+            return
+        end
+        busy = true
+        setStatus("blocking events...", "busy")
+        task.spawn(function()
+            local ok, a, b = pcall(eventBlock.Block)
+            if ok and a then
+                pendingMsg, pendingKind = (b or "blocked"), "ok"
+            else
+                pendingMsg, pendingKind = "events: " .. tostring(b or a), "err"
+            end
+            busy = false
+        end)
+    end)
+
+    task.spawn(function()
+        while row.Parent do
+            if pendingMsg then
+                local msg, kind = pendingMsg, pendingKind
+                pendingMsg, pendingKind = nil, nil
+                if kind == "ok" then blockedUntil = os.clock() + 1 end
+                pcall(setStatus, msg, kind)
+            end
+            pcall(render)
+            task.wait(0.2)
+        end
+    end)
+    render()
+end
+
+local SettingsWindow, 
+... (75 KB left)
